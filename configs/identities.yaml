@@ -1,7 +1,7 @@
 identities:
   hermione:
     name: "Hermione Granger"
-    lora_path: "data/loras/hermione.safetensors"
+    lora_path: "data/loras/hermonie.safetensors"
     lora_trigger: "Hermione_Granger"
     reference_image: "data/reference_faces/hermione.png"
 
