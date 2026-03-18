@@ -1,0 +1,10 @@
+# LoRA model files (too large for GitHub — download from Google Drive)
+data/loras/*.safetensors
+data/loras/*.bin
+data/loras/*.pt
+data/loras/*.ckpt
+
+# Python
+__pycache__/
+*.pyc
+.env
