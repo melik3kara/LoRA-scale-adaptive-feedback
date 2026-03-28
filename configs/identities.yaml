@@ -3,10 +3,10 @@ identities:
     name: "Hermione Granger"
     lora_path: "data/loras/hermonie.safetensors"
     lora_trigger: "Hermione_Granger"
-    reference_image: "data/reference_faces/hermione.png"
+    reference_image: "data/reference_faces/reference_hermonie.png"
 
   daenerys:
     name: "Daenerys Targaryen"
     lora_path: "data/loras/daenerys.safetensors"
     lora_trigger: "dae woman"
-    reference_image: "data/reference_faces/daenerys.png"
+    reference_image: "data/reference_faces/reference_daenerys.png"
