@@ -14,6 +14,7 @@ import yaml
 import torch
 from PIL import Image
 from diffusers import StableDiffusionXLControlNetPipeline, ControlNetModel, AutoencoderKL
+from attention import create_identity_masks, get_trigger_token_indices, set_regional_attention, remove_regional_attention
 
 
 # ── helpers ──────────────────────────────────────────────────────────
@@ -125,20 +126,25 @@ def generate(
     seed: int = 42,
     width: int = 1024,
     height: int = 1024,
+    use_regional_attention: bool = False,
+    identity_regions: dict | None = None,
 ) -> Image.Image:
     """
     Generate a multi-identity image.
 
     Args:
-        pipe:           The built SDXL pipeline.
-        identities:     Identity config dict from load_identities().
-        pose_image:     OpenPose skeleton image for ControlNet.
-        lora_scales:    Per-identity LoRA scales, e.g. {"hermione": 0.7, "daenerys": 0.5}.
-                        Defaults to 0.8 for all if not provided.
-        ctrl_scale:     ControlNet conditioning scale.
-        prompt:         Text prompt. Auto-generated from trigger words if None.
-        negative_prompt: Negative prompt.
-        seed:           Random seed for reproducibility.
+        pipe:                    The built SDXL pipeline.
+        identities:              Identity config dict from load_identities().
+        pose_image:              OpenPose skeleton image for ControlNet.
+        lora_scales:             Per-identity LoRA scales, e.g. {"hermione": 0.7, "daenerys": 0.5}.
+                                 Defaults to 0.8 for all if not provided.
+        ctrl_scale:              ControlNet conditioning scale.
+        prompt:                  Text prompt. Auto-generated from trigger words if None.
+        negative_prompt:         Negative prompt.
+        seed:                    Random seed for reproducibility.
+        use_regional_attention:  Apply regional attention masking to reduce identity leakage.
+        identity_regions:        Bounding boxes per identity {id: (x1, y1, x2, y2)}.
+                                 Defaults to left/right split when None.
     """
     adapter_names = list(identities.keys())
 
@@ -158,18 +164,40 @@ def generate(
     # Resize pose image to match output dimensions
     pose_image_resized = pose_image.resize((width, height))
 
+    # Apply regional attention masking if requested
+    if use_regional_attention:
+        if identity_regions is None:
+            # Default: split image vertically (left = first identity, right = second)
+            mid = width // 2
+            identity_regions = {
+                adapter_names[0]: (0,    0, mid,   height),
+                adapter_names[1]: (mid,  0, width, height),
+            }
+
+        spatial_masks = create_identity_masks(width, height, identity_regions)
+        trigger_words  = {k: identities[k]["lora_trigger"] for k in adapter_names}
+        token_assignments = get_trigger_token_indices(
+            pipe.tokenizer, prompt, trigger_words
+        )
+        set_regional_attention(pipe, spatial_masks, token_assignments)
+        print(f"[pipeline] Regional attention enabled: {identity_regions}")
+
     generator = torch.Generator(device="cpu").manual_seed(seed)
 
-    image = pipe(
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        image=pose_image_resized,
-        controlnet_conditioning_scale=ctrl_scale,
-        generator=generator,
-        num_inference_steps=num_inference_steps,
-        width=width,
-        height=height,
-    ).images[0]
+    try:
+        image = pipe(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            image=pose_image_resized,
+            controlnet_conditioning_scale=ctrl_scale,
+            generator=generator,
+            num_inference_steps=num_inference_steps,
+            width=width,
+            height=height,
+        ).images[0]
+    finally:
+        if use_regional_attention:
+            remove_regional_attention(pipe)
 
     return image
 
