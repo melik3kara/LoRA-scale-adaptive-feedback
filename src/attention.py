@@ -41,6 +41,7 @@ class RegionalAttnProcessor:
         self.mask_self_attention = mask_self_attention
         self.mask_weight = mask_weight
         self._mask_cache = {}
+        self._warned_seq_lens = set()
 
     def _get_spatial_masks(self, height, width, device):
         cache_key = (height, width)
@@ -104,6 +105,16 @@ class RegionalAttnProcessor:
 
         spatial_size = int(seq_len ** 0.5)
         if spatial_size * spatial_size != seq_len:
+            # Warn once per unexpected seq_len — small seq_lens are expected
+            # (non-spatial layers like mid-block), but large ones likely
+            # indicate a spatial layer where regional masking silently failed
+            if seq_len > 256 and seq_len not in self._warned_seq_lens:
+                print(
+                    f"[attention] WARNING: seq_len={seq_len} is not a perfect square — "
+                    f"skipping regional mask. This may indicate non-square image generation "
+                    f"or an unexpected feature map shape."
+                )
+                self._warned_seq_lens.add(seq_len)
             return self._default_attention(attn, hidden_states, encoder_hidden_states, attention_mask)
 
         query = attn.to_q(hidden_states)
