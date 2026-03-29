@@ -154,11 +154,31 @@ def generate(
     adapter_weights = [lora_scales.get(k, 0.8) for k in adapter_names]
     pipe.set_adapters(adapter_names, adapter_weights=adapter_weights)
 
+    # Resolve identity regions early so prompt construction can use them
+    if use_regional_attention and identity_regions is None:
+        mid = width // 2
+        identity_regions = {
+            adapter_names[0]: (0,    0, mid,   height),
+            adapter_names[1]: (mid,  0, width, height),
+        }
+
     # Build prompt from trigger words if not provided
     if prompt is None:
-        triggers = " and ".join(
-            identities[k]["lora_trigger"] for k in adapter_names
-        )
+        if identity_regions is not None:
+            # Sort identities by x-position so prompt matches spatial layout
+            sorted_ids = sorted(
+                identity_regions.keys(),
+                key=lambda k: identity_regions[k][0],  # sort by x1
+            )
+            trigger_parts = [
+                f"{identities[k]['lora_trigger']} on the {'left' if i == 0 else 'right'}"
+                for i, k in enumerate(sorted_ids)
+            ]
+            triggers = " and ".join(trigger_parts)
+        else:
+            triggers = " and ".join(
+                identities[k]["lora_trigger"] for k in adapter_names
+            )
         prompt = f"portrait photo of {triggers}, two people, soft natural lighting, high quality"
 
     # Resize pose image to match output dimensions
@@ -166,21 +186,15 @@ def generate(
 
     # Apply regional attention masking if requested
     if use_regional_attention:
-        if identity_regions is None:
-            # Default: split image vertically (left = first identity, right = second)
-            mid = width // 2
-            identity_regions = {
-                adapter_names[0]: (0,    0, mid,   height),
-                adapter_names[1]: (mid,  0, width, height),
-            }
-
         spatial_masks = create_identity_masks(width, height, identity_regions)
-        trigger_words  = {k: identities[k]["lora_trigger"] for k in adapter_names}
+        trigger_words = {k: identities[k]["lora_trigger"] for k in adapter_names}
         token_assignments = get_trigger_token_indices(
             pipe.tokenizer, prompt, trigger_words
         )
         set_regional_attention(pipe, spatial_masks, token_assignments)
         print(f"[pipeline] Regional attention enabled: {identity_regions}")
+
+    print(f"[pipeline] Prompt: {prompt}")
 
     generator = torch.Generator(device="cpu").manual_seed(seed)
 
