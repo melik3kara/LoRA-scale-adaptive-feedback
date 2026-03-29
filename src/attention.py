@@ -138,12 +138,12 @@ class RegionalAttnProcessor:
             regional_mask = self._build_cross_attention_mask(
                 seq_len, num_tokens, spatial_size, spatial_size, hidden_states.device
             )
-            attn_scores = attn_scores + regional_mask.unsqueeze(0).unsqueeze(0)
+            attn_scores = attn_scores + regional_mask.unsqueeze(0).unsqueeze(0).to(dtype=attn_scores.dtype)
         elif self.mask_self_attention:
             regional_mask = self._build_self_attention_mask(
                 seq_len, spatial_size, spatial_size, hidden_states.device
             )
-            attn_scores = attn_scores + regional_mask.unsqueeze(0).unsqueeze(0)
+            attn_scores = attn_scores + regional_mask.unsqueeze(0).unsqueeze(0).to(dtype=attn_scores.dtype)
 
         if attention_mask is not None:
             attn_scores = attn_scores + attention_mask
@@ -231,12 +231,9 @@ def set_regional_attention(
         mask_self_attention=mask_self_attention,
     )
 
-    attn_processors = {}
-    for name in pipe.unet.attn_processors.keys():
-        attn_processors[name] = processor
-
-    pipe.unet.set_attn_processor(attn_processors)
-    print(f"Regional attention set: {len(attn_processors)} layers masked")
+    # Pass single processor — diffusers applies it to ALL attention layers
+    pipe.unet.set_attn_processor(processor)
+    print(f"Regional attention set: {len(pipe.unet.attn_processors)} layers masked")
 
 
 def remove_regional_attention(pipe):
