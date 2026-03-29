@@ -33,6 +33,15 @@ class FaceScorer:
         device: str = "cuda",
         det_size: int = 640,
     ):
+        """
+        Args:
+            reference_dir:  Directory containing reference face images.
+                            Supports naming: {identity_id}.png or reference_{identity_id}.png
+                            Images can be full portraits or pre-cropped faces — the scorer
+                            detects and aligns faces automatically.
+            device:         "cuda" or "cpu".
+            det_size:       Detection resolution. Higher = better detection but slower.
+        """
         self.reference_dir = reference_dir
         self.device = device
 
@@ -52,18 +61,37 @@ class FaceScorer:
         self._load_references()
 
     def _load_references(self):
-        """Load reference face images and extract their ArcFace embeddings."""
+        """
+        Load reference face images and extract their ArcFace embeddings.
+
+        Handles multiple naming conventions:
+            - {identity_id}.png              (e.g. daenerys.png)
+            - reference_{identity_id}.png    (e.g. reference_daenerys.png)
+
+        Works with both pre-cropped face images AND full portraits —
+        InsightFace detects and aligns the face automatically before
+        computing the embedding.
+        """
         if not os.path.exists(self.reference_dir):
             print(f"[scorer] WARNING: Reference directory {self.reference_dir} not found.")
             print(f"[scorer] Run extract_reference.py first.")
             return
 
         for fname in os.listdir(self.reference_dir):
-            # Skip full portraits, only use cropped faces
-            if fname.endswith("_full.png") or not fname.endswith(".png"):
+            # Skip non-images and full portrait backups
+            if not fname.endswith(".png") and not fname.endswith(".jpg"):
+                continue
+            if fname.endswith("_full.png"):
                 continue
 
-            identity_id = fname.replace(".png", "")
+            # Extract identity_id from filename
+            # Supports: "daenerys.png", "reference_daenerys.png"
+            name_no_ext = os.path.splitext(fname)[0]
+            if name_no_ext.startswith("reference_"):
+                identity_id = name_no_ext[len("reference_"):]
+            else:
+                identity_id = name_no_ext
+
             fpath = os.path.join(self.reference_dir, fname)
 
             img = np.array(Image.open(fpath).convert("RGB"))
@@ -76,11 +104,12 @@ class FaceScorer:
                 print(f"[scorer] Re-run extract_reference.py or provide a better reference.")
                 continue
 
+            # Use the largest face — works for both cropped and full portrait images
             face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
             embedding = face.normed_embedding
 
             self.reference_embeddings[identity_id] = embedding
-            print(f"[scorer] Loaded reference embedding for '{identity_id}'")
+            print(f"[scorer] Loaded reference embedding for '{identity_id}' (from {fname})")
 
         if not self.reference_embeddings:
             print("[scorer] WARNING: No reference embeddings loaded!")
@@ -169,6 +198,7 @@ class FaceScorer:
         return assignments
 
     def cosine_similarity(self, emb1: np.ndarray, emb2: np.ndarray) -> float:
+        """Compute cosine similarity between two normalized embeddings."""
         return float(np.dot(emb1, emb2))
 
     def score_image(
