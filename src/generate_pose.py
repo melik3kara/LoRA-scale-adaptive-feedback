@@ -58,14 +58,38 @@ def make_synthetic_two_person_pose(width=1024, height=1024) -> Image.Image:
     img = Image.new("RGB", (width, height), (0, 0, 0))
     draw = ImageDraw.Draw(img)
 
-    # Define keypoints for two people (normalised 0-1, then scaled)
-    # Format: [nose, neck, r_shoulder, r_elbow, r_wrist,
-    #          l_shoulder, l_elbow, l_wrist,
-    #          r_hip, r_knee, r_ankle,
-    #          l_hip, l_knee, l_ankle,
-    #          r_eye, l_eye, r_ear, l_ear]
+    person1, person2 = _synthetic_two_person_raw_kps()
 
-    # Person 1 — left side of frame
+    for person_kps in [person1, person2]:
+        kps = [(int(x * width), int(y * height)) for x, y in person_kps]
+
+        for idx, (start, end) in enumerate(POSE_CONNECTIONS):
+            color = LIMB_COLORS[idx % len(LIMB_COLORS)]
+            draw.line([kps[start], kps[end]], fill=color, width=4)
+
+        for x, y in kps:
+            r = 5
+            draw.ellipse([x - r, y - r, x + r, y + r], fill=KEYPOINT_COLOR)
+
+    return img
+
+
+def get_synthetic_target_keypoints() -> list[list]:
+    """
+    Return the synthetic 2-person keypoints in PoseScorer format:
+      List[person] of List[18 tuples (x_norm, y_norm, confidence)].
+    Use this instead of running OpenposeDetector on the rendered skeleton
+    (the detector is trained on real photos and fails on stylized renders).
+    """
+    person1, person2 = _synthetic_two_person_raw_kps()
+    return [
+        [(x, y, 1.0) for x, y in person1],
+        [(x, y, 1.0) for x, y in person2],
+    ]
+
+
+def _synthetic_two_person_raw_kps() -> tuple[list, list]:
+    """Raw normalized (x, y) coordinates for the synthetic 2-person pose."""
     person1 = [
         (0.30, 0.18),   # 0  nose
         (0.30, 0.25),   # 1  neck
@@ -109,21 +133,7 @@ def make_synthetic_two_person_pose(width=1024, height=1024) -> Image.Image:
         (0.75, 0.17),   # 17 left ear
     ]
 
-    for person_kps in [person1, person2]:
-        # Scale to image dimensions
-        kps = [(int(x * width), int(y * height)) for x, y in person_kps]
-
-        # Draw limbs
-        for idx, (start, end) in enumerate(POSE_CONNECTIONS):
-            color = LIMB_COLORS[idx % len(LIMB_COLORS)]
-            draw.line([kps[start], kps[end]], fill=color, width=4)
-
-        # Draw keypoints
-        for x, y in kps:
-            r = 5
-            draw.ellipse([x - r, y - r, x + r, y + r], fill=KEYPOINT_COLOR)
-
-    return img
+    return person1, person2
 
 
 def extract_pose_from_image(image_path: str) -> Image.Image:
