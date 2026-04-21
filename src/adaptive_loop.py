@@ -60,9 +60,9 @@ def multi_lora_adaptive_generate(
     ctrl_scale: float = 0.7,
     id_threshold: float = 0.40,
     pose_threshold: float = 0.50,
-    alpha_init: float = 0.5,
-    alpha_min: float = 0.2,
-    alpha_max: float = 1.0,
+    alpha_init: float | dict = 0.5,
+    alpha_min: float | dict = 0.2,
+    alpha_max: float | dict = 1.0,
     delta_up: float = 0.15,
     delta_down: float = 0.10,
     max_iters: int = 5,
@@ -97,8 +97,12 @@ def multi_lora_adaptive_generate(
     """
     t_start = time.time()
 
+    # Per-identity or scalar config
+    def _resolve(param, identity_id):
+        return param[identity_id] if isinstance(param, dict) else param
+
     states = {
-        k: IdentityState(identity_id=k, alpha=alpha_init)
+        k: IdentityState(identity_id=k, alpha=_resolve(alpha_init, k))
         for k in identities
     }
 
@@ -173,12 +177,15 @@ def multi_lora_adaptive_generate(
             arcface_sim = face_scores.get(identity_id, {}).get("arcface", 0.0)
             pose_sim    = pose_scores.get(identity_id, {}).get("pose",    0.0)
 
+            a_min = _resolve(alpha_min, identity_id)
+            a_max = _resolve(alpha_max, identity_id)
+
             if pose_sim < pose_threshold:
                 # Pose drifted — pull alpha back
-                state.alpha = max(state.alpha - delta_down, alpha_min)
+                state.alpha = max(state.alpha - delta_down, a_min)
             elif arcface_sim < id_threshold:
                 # Identity weak — push alpha up
-                state.alpha = min(state.alpha + delta_up, alpha_max)
+                state.alpha = min(state.alpha + delta_up, a_max)
 
     n_converged = sum(1 for s in states.values() if s.converged)
     if n_converged == len(states):
