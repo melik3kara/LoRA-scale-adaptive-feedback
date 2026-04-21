@@ -39,7 +39,7 @@ class IdentityState:
 
 @dataclass
 class AdaptiveResult:
-    image: Image.Image
+    image: Image.Image           # best image seen across iterations
     identity_states: dict
     total_iterations: int
     status: str                  # "all_converged" | "partial" | "none_converged"
@@ -47,6 +47,8 @@ class AdaptiveResult:
     final_arcface: dict
     final_pose: dict
     total_time_s: float
+    best_iteration: int = -1     # iteration index (0-based) of returned image
+    last_image: Optional[Image.Image] = None
 
 
 def multi_lora_adaptive_generate(
@@ -110,6 +112,15 @@ def multi_lora_adaptive_generate(
     last_face_scores = {}
     last_pose_scores = {}
 
+    # Track best iteration — score = mean over identities of min(arcface, pose).
+    # Using min(arcface, pose) per identity penalises configs where one metric
+    # is great but the other collapsed (a common failure mode of this loop).
+    best_image = None
+    best_score = -float("inf")
+    best_iter = -1
+    best_face_scores = {}
+    best_pose_scores = {}
+
     for iteration in range(max_iters):
         # Build per-identity LoRA scales from current state
         lora_scales = {k: states[k].alpha for k in identities}
@@ -134,6 +145,21 @@ def multi_lora_adaptive_generate(
         pose_scores = pose_scorer.score_image(img, target_keypoints, identity_regions)
         last_face_scores = face_scores
         last_pose_scores = pose_scores
+
+        # Rank this iteration against previous best
+        per_id_scores = []
+        for k in identities:
+            arc = face_scores.get(k, {}).get("arcface", 0.0)
+            pos = pose_scores.get(k, {}).get("pose",    0.0)
+            # If pose was not measurable (0.0), fall back to arcface alone
+            per_id_scores.append(arc if pos == 0.0 else min(arc, pos))
+        iter_score = sum(per_id_scores) / max(len(per_id_scores), 1)
+        if iter_score > best_score:
+            best_score = iter_score
+            best_image = img
+            best_iter = iteration
+            best_face_scores = face_scores
+            best_pose_scores = pose_scores
 
         # Update each identity's state
         for identity_id in identities:
@@ -202,15 +228,27 @@ def multi_lora_adaptive_generate(
 
     total_time = time.time() - t_start
 
+    # Return the BEST image seen, not the last — the loop can oscillate past
+    # a good iteration. final_arcface/final_pose reflect the returned image.
+    chosen_image = best_image if best_image is not None else last_image
+    chosen_face  = best_face_scores if best_image is not None else last_face_scores
+    chosen_pose  = best_pose_scores if best_image is not None else last_pose_scores
+
+    if verbose and best_image is not None:
+        print(f"[adaptive] Returning best iteration: {best_iter+1} "
+              f"(composite score={best_score:.3f})")
+
     return AdaptiveResult(
-        image=last_image,
+        image=chosen_image,
         identity_states=states,
         total_iterations=iteration + 1,
         status=status,
         final_alphas={k: states[k].alpha for k in states},
-        final_arcface={k: last_face_scores.get(k, {}).get("arcface", 0.0) for k in states},
-        final_pose={k: last_pose_scores.get(k, {}).get("pose", 0.0) for k in states},
+        final_arcface={k: chosen_face.get(k, {}).get("arcface", 0.0) for k in states},
+        final_pose={k: chosen_pose.get(k, {}).get("pose", 0.0) for k in states},
         total_time_s=round(total_time, 2),
+        best_iteration=best_iter,
+        last_image=last_image,
     )
 
 

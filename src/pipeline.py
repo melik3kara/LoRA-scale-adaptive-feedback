@@ -121,7 +121,7 @@ def generate(
     lora_scales: dict[str, float] | None = None,
     ctrl_scale: float = 0.7,
     prompt: str | None = None,
-    negative_prompt: str = "blurry, low quality, deformed face, extra limbs",
+    negative_prompt: str = "blurry, low quality, deformed face, extra limbs, extra person, three people, crowd, group of people, duplicate, clone",
     num_inference_steps: int = 30,
     seed: int = 42,
     width: int = 1024,
