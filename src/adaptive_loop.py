@@ -148,9 +148,11 @@ def multi_lora_adaptive_generate(
                 "pose":      pose_sim,
             })
 
-            # Convergence check: both identity and pose must be good
+            # Convergence check: both identity and pose must be good.
+            # pose_sim == 0.0 usually means the pose scorer failed to detect
+            # or assign a person — treat it as "unknown" rather than "failed".
             id_ok   = arcface_sim >= id_threshold
-            pose_ok = pose_sim    >= pose_threshold
+            pose_ok = pose_sim >= pose_threshold or pose_sim == 0.0
 
             if id_ok and pose_ok:
                 state.converged = True
@@ -180,7 +182,10 @@ def multi_lora_adaptive_generate(
             a_min = _resolve(alpha_min, identity_id)
             a_max = _resolve(alpha_max, identity_id)
 
-            if pose_sim < pose_threshold:
+            # Only trust pose signal when > 0 (0.0 means the scorer gave up).
+            pose_reliable = pose_sim > 0.0
+
+            if pose_reliable and pose_sim < pose_threshold:
                 # Pose drifted — pull alpha back
                 state.alpha = max(state.alpha - delta_down, a_min)
             elif arcface_sim < id_threshold:
