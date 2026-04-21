@@ -191,8 +191,9 @@ def generate(
         token_assignments = get_trigger_token_indices(
             pipe.tokenizer, prompt, trigger_words
         )
-        set_regional_attention(pipe, spatial_masks, token_assignments)
-        print(f"[pipeline] Regional attention enabled: {identity_regions}")
+        # Only cross-attention masking — self-attention masking causes "head+body" artefacts
+        set_regional_attention(pipe, spatial_masks, token_assignments, mask_self_attention=False)
+        print(f"[pipeline] Regional attention enabled (cross-attention only): {identity_regions}")
 
     print(f"[pipeline] Prompt: {prompt}")
 
