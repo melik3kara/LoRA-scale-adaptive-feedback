@@ -4,9 +4,30 @@ identities:
     lora_path: "data/loras/hermonie.safetensors"
     lora_trigger: "Hermione_Granger"
     reference_image: "data/reference_faces/reference_hermione.png"
+    # Rich physical description — CLIP uses these tokens to steer the
+    # generation even when the LoRA pulls hard. Include hair, build, attire,
+    # distinctive features.
+    visual_description: "young woman with long bushy brown hair, hazel eyes, fair skin, wearing a black Hogwarts school robe"
+    # Features to suppress in *this* identity's region — typically the
+    # strongest visual traits of the OTHER identity in the scene, so the
+    # two don't collapse into each other.
+    negative_features: "blonde hair, silver hair, platinum hair, white hair, crown"
+    # Phrases that the regional attention mechanism should spatially bind
+    # to this identity's region. Include the trigger AND the most distinctive
+    # descriptor phrases so those tokens cannot leak across regions.
+    attention_phrases:
+      - "Hermione_Granger"
+      - "bushy brown hair"
+      - "Hogwarts school robe"
 
   daenerys:
     name: "Daenerys Targaryen"
     lora_path: "data/loras/daenerys.safetensors"
     lora_trigger: "dae woman"
     reference_image: "data/reference_faces/reference_daenerys.png"
+    visual_description: "woman with long straight platinum silver-white hair, violet eyes, pale skin, wearing a regal blue dress"
+    negative_features: "brown hair, brunette, bushy hair, curly hair, witch robe, school uniform"
+    attention_phrases:
+      - "dae woman"
+      - "platinum silver-white hair"
+      - "regal blue dress"

@@ -252,6 +252,71 @@ def multi_lora_adaptive_generate(
     )
 
 
+def run_adaptive_best_of_n(
+    pipe,
+    identities: dict,
+    pose_image: Image.Image,
+    face_scorer: FaceScorer,
+    pose_scorer: PoseScorer,
+    target_keypoints: list,
+    identity_regions: dict,
+    seeds: list,
+    use_regional_attention: bool = True,
+    verbose: bool = True,
+    **adaptive_kwargs,
+) -> AdaptiveResult:
+    """
+    Run the adaptive loop across multiple seeds and return the single best
+    AdaptiveResult (by composite score: mean of per-identity min(arcface, pose)).
+
+    Identity separation is very seed-sensitive with multi-LoRA pipelines — some
+    seeds avoid the dominance collapse and others fall straight into it. Running
+    a handful and keeping the best one is the cheapest way to get a usable
+    image without tuning hyperparameters further.
+    """
+    def composite(result: AdaptiveResult) -> float:
+        scores = []
+        for k in identities:
+            arc = result.final_arcface.get(k, 0.0)
+            pos = result.final_pose.get(k, 0.0)
+            scores.append(arc if pos == 0.0 else min(arc, pos))
+        return sum(scores) / max(len(scores), 1)
+
+    best: Optional[AdaptiveResult] = None
+    best_seed: Optional[int] = None
+    best_score = -float("inf")
+
+    for i, seed in enumerate(seeds):
+        if verbose:
+            print(f"\n{'='*60}\n[best-of-n] seed {seed} ({i+1}/{len(seeds)})\n{'='*60}")
+        result = multi_lora_adaptive_generate(
+            pipe, identities, pose_image,
+            face_scorer, pose_scorer, target_keypoints, identity_regions,
+            seed=seed,
+            use_regional_attention=use_regional_attention,
+            verbose=verbose,
+            **adaptive_kwargs,
+        )
+        score = composite(result)
+        if verbose:
+            print(f"[best-of-n] seed {seed} composite score: {score:.3f}")
+        if score > best_score:
+            best_score = score
+            best = result
+            best_seed = seed
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    if verbose and best is not None:
+        print(f"\n[best-of-n] Winner: seed={best_seed}  composite={best_score:.3f}")
+        print(f"[best-of-n] Best alphas:  {best.final_alphas}")
+        print(f"[best-of-n] Best arcface: {best.final_arcface}")
+        print(f"[best-of-n] Best pose:    {best.final_pose}")
+
+    return best
+
+
 def run_adaptive_experiment(
     pipe,
     identities: dict,

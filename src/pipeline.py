@@ -17,6 +17,51 @@ from diffusers import StableDiffusionXLControlNetPipeline, ControlNetModel, Auto
 from attention import create_identity_masks, get_trigger_token_indices, set_regional_attention, remove_regional_attention
 
 
+def _find_phrase_token_indices(tokenizer, prompt: str, phrase: str) -> list[int]:
+    """Return the token indices (1-based — +1 for BOS) of every occurrence of `phrase`."""
+    full_tokens = tokenizer.encode(prompt, add_special_tokens=False)
+    phrase_tokens = tokenizer.encode(phrase, add_special_tokens=False)
+    if not phrase_tokens:
+        return []
+    plen = len(phrase_tokens)
+    indices: list[int] = []
+    for i in range(len(full_tokens) - plen + 1):
+        if full_tokens[i:i + plen] == phrase_tokens:
+            indices.extend(range(i + 1, i + plen + 1))  # +1 for BOS
+    return indices
+
+
+def _build_attention_token_assignments(
+    tokenizer,
+    prompt: str,
+    identities: dict,
+) -> dict:
+    """
+    For each identity, collect token indices of all its attention_phrases
+    (falling back to lora_trigger) in the full tokenized prompt.
+
+    Expanding the mask beyond the trigger keeps the descriptive tokens (hair,
+    attire, etc.) bound to their identity's region and prevents cross-region
+    feature bleed — the main failure mode with rich prompts.
+    """
+    assignments: dict = {}
+    for k, meta in identities.items():
+        phrases = list(meta.get("attention_phrases") or [])
+        trigger = meta.get("lora_trigger", "")
+        if trigger and trigger not in phrases:
+            phrases.append(trigger)
+
+        seen: set[int] = set()
+        ordered: list[int] = []
+        for phrase in phrases:
+            for idx in _find_phrase_token_indices(tokenizer, prompt, phrase):
+                if idx not in seen:
+                    seen.add(idx)
+                    ordered.append(idx)
+        assignments[k] = ordered
+    return assignments
+
+
 # ── helpers ──────────────────────────────────────────────────────────
 
 def get_device():
@@ -114,6 +159,61 @@ def build_pipeline(
 
 # ── generation ───────────────────────────────────────────────────────
 
+_BASE_NEGATIVE = (
+    "blurry, low quality, deformed face, extra limbs, extra person, three people, "
+    "crowd, group of people, duplicate, clone, twins, identical faces, same face, "
+    "merged bodies, conjoined, disfigured, asymmetric eyes"
+)
+
+
+def _build_structured_prompt(identities: dict, identity_regions: dict | None) -> str:
+    """
+    Build a richly-described spatially-ordered prompt from identity metadata.
+
+    Uses visual_description from identities.yaml when available so CLIP has
+    concrete physical tokens to latch onto — this is the main defence against
+    one LoRA dominating the scene visually.
+    """
+    if identity_regions is not None:
+        ordered = sorted(identity_regions.keys(), key=lambda k: identity_regions[k][0])
+    else:
+        ordered = list(identities.keys())
+
+    pos_labels = ["left", "right", "center"]
+    parts = []
+    for i, k in enumerate(ordered):
+        trigger = identities[k].get("lora_trigger", "")
+        desc    = identities[k].get("visual_description", "")
+        pos     = pos_labels[i] if i < len(pos_labels) else f"position {i+1}"
+        parts.append(
+            f"on the {pos}, {desc}, {trigger}" if desc else f"{trigger} on the {pos}"
+        )
+
+    body = ". ".join(parts)
+    # Keep the full prompt under ~77 CLIP tokens so nothing critical is
+    # truncated. Identity clauses stay at the front; polish is minimal.
+    return (
+        f"Two women side by side. {body}. "
+        f"Different faces, different hair colors, photorealistic"
+    )
+
+
+def _build_combined_negative(identities: dict, base_negative: str) -> str:
+    """
+    Append each identity's negative_features to the base negative prompt.
+    Each identity's negative_features typically lists the OTHER identity's
+    distinctive traits, which helps suppress feature-bleed globally.
+    """
+    extras = []
+    for k, meta in identities.items():
+        nf = meta.get("negative_features")
+        if nf:
+            extras.append(nf)
+    if not extras:
+        return base_negative
+    return base_negative + ", " + ", ".join(extras)
+
+
 def generate(
     pipe: StableDiffusionXLControlNetPipeline,
     identities: dict,
@@ -121,13 +221,14 @@ def generate(
     lora_scales: dict[str, float] | None = None,
     ctrl_scale: float = 0.7,
     prompt: str | None = None,
-    negative_prompt: str = "blurry, low quality, deformed face, extra limbs, extra person, three people, crowd, group of people, duplicate, clone",
+    negative_prompt: str | None = None,
     num_inference_steps: int = 30,
     seed: int = 42,
     width: int = 1024,
     height: int = 1024,
     use_regional_attention: bool = False,
     identity_regions: dict | None = None,
+    guidance_scale: float = 7.5,
 ) -> Image.Image:
     """
     Generate a multi-identity image.
@@ -162,24 +263,12 @@ def generate(
             adapter_names[1]: (mid,  0, width, height),
         }
 
-    # Build prompt from trigger words if not provided
+    # Build prompt from identity metadata if not provided
     if prompt is None:
-        if identity_regions is not None:
-            # Sort identities by x-position so prompt matches spatial layout
-            sorted_ids = sorted(
-                identity_regions.keys(),
-                key=lambda k: identity_regions[k][0],  # sort by x1
-            )
-            trigger_parts = [
-                f"{identities[k]['lora_trigger']} on the {'left' if i == 0 else 'right'}"
-                for i, k in enumerate(sorted_ids)
-            ]
-            triggers = " and ".join(trigger_parts)
-        else:
-            triggers = " and ".join(
-                identities[k]["lora_trigger"] for k in adapter_names
-            )
-        prompt = f"portrait photo of {triggers}, two people, soft natural lighting, high quality"
+        prompt = _build_structured_prompt(identities, identity_regions)
+
+    if negative_prompt is None:
+        negative_prompt = _build_combined_negative(identities, _BASE_NEGATIVE)
 
     # Resize pose image to match output dimensions
     pose_image_resized = pose_image.resize((width, height))
@@ -187,13 +276,16 @@ def generate(
     # Apply regional attention masking if requested
     if use_regional_attention:
         spatial_masks = create_identity_masks(width, height, identity_regions)
-        trigger_words = {k: identities[k]["lora_trigger"] for k in adapter_names}
-        token_assignments = get_trigger_token_indices(
-            pipe.tokenizer, prompt, trigger_words
+        # Expanded assignments: mask trigger AND descriptive attention_phrases
+        # so identity features can't leak across regions.
+        token_assignments = _build_attention_token_assignments(
+            pipe.tokenizer, prompt, identities
         )
         # Only cross-attention masking — self-attention masking causes "head+body" artefacts
         set_regional_attention(pipe, spatial_masks, token_assignments, mask_self_attention=False)
         print(f"[pipeline] Regional attention enabled (cross-attention only): {identity_regions}")
+        for k, idxs in token_assignments.items():
+            print(f"[pipeline]   {k} attention tokens: {idxs}")
 
     print(f"[pipeline] Prompt: {prompt}")
 
@@ -207,6 +299,7 @@ def generate(
             controlnet_conditioning_scale=ctrl_scale,
             generator=generator,
             num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
             width=width,
             height=height,
         ).images[0]
