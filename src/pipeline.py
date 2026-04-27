@@ -361,6 +361,243 @@ def generate(
     return image
 
 
+# ── two-stage generation: layout-first, then identity ────────────────
+
+def generate_two_stage(
+    pipe: StableDiffusionXLControlNetPipeline,
+    identities: dict,
+    pose_image: Image.Image,
+    pose_image_open: Image.Image | None = None,
+    layout_lora_scales: dict | None = None,
+    identity_lora_scales: dict | None = None,
+    layout_ctrl_scale: float = 1.0,
+    identity_ctrl_scale: float = 0.7,
+    refine_strength: float = 0.55,
+    refine_steps: int = 28,
+    layout_steps: int = 28,
+    seed: int = 42,
+    width: int = 1024,
+    height: int = 1024,
+    use_regional_attention: bool = True,
+    use_spatial_lora_gate: bool = True,
+    identity_regions: dict | None = None,
+    guidance_scale: float = 7.5,
+    **_unused,
+) -> tuple[Image.Image, Image.Image]:
+    """
+    Two-stage generation:
+      Stage 1 (layout): low LoRA scales, high ControlNet — locks pose,
+                         body placement, left/right separation.
+      Stage 2 (identity): re-runs ControlNet+img2img on stage-1 output with
+                          high (asymmetric) LoRA scales, lower ControlNet,
+                          and partial denoising — refines faces/attire
+                          without re-deciding the composition.
+
+    Returns (stage1_image, stage2_image).
+    """
+    from diffusers import StableDiffusionXLControlNetImg2ImgPipeline
+
+    # Stage 1 — layout locking
+    if layout_lora_scales is None:
+        layout_lora_scales = {k: 0.2 for k in identities}
+
+    print("[pipeline] Two-stage: STAGE 1 (layout)")
+    stage1_img = generate(
+        pipe, identities, pose_image,
+        lora_scales=layout_lora_scales,
+        ctrl_scale=layout_ctrl_scale,
+        num_inference_steps=layout_steps,
+        seed=seed,
+        width=width,
+        height=height,
+        use_regional_attention=use_regional_attention,
+        # No spatial gate at layout stage — we want layout signal to spread
+        use_spatial_lora_gate=False,
+        identity_regions=identity_regions,
+        guidance_scale=guidance_scale,
+    )
+
+    # Stage 2 — identity refinement via ControlNet img2img on stage-1 output.
+    # The img2img pipeline shares weights/adapters with `pipe`, so all the
+    # adapter scale changes we make propagate.
+    img2img = StableDiffusionXLControlNetImg2ImgPipeline(
+        vae=pipe.vae,
+        text_encoder=pipe.text_encoder,
+        text_encoder_2=pipe.text_encoder_2,
+        tokenizer=pipe.tokenizer,
+        tokenizer_2=pipe.tokenizer_2,
+        unet=pipe.unet,
+        controlnet=pipe.controlnet,
+        scheduler=pipe.scheduler,
+    )
+
+    if identity_lora_scales is None:
+        identity_lora_scales = {k: 0.8 for k in identities}
+    adapter_names = list(identities.keys())
+    adapter_weights = [_to_peft_scale(identity_lora_scales.get(k, 0.8)) for k in adapter_names]
+    pipe.set_adapters(adapter_names, adapter_weights=adapter_weights)
+
+    if identity_regions is None and use_regional_attention:
+        mid = width // 2
+        identity_regions = {
+            adapter_names[0]: (0,    0, mid,   height),
+            adapter_names[1]: (mid,  0, width, height),
+        }
+
+    prompt = _build_structured_prompt(identities, identity_regions)
+    negative_prompt = _build_combined_negative(identities, _BASE_NEGATIVE)
+    pose_image_resized = pose_image.resize((width, height))
+
+    gate_handles = None
+    if use_spatial_lora_gate and identity_regions is not None:
+        from lora_gate import set_spatially_gated_lora
+        gate_masks = create_identity_masks(width, height, identity_regions)
+        gate_handles = set_spatially_gated_lora(pipe, gate_masks, latent_size=height // 8)
+
+    if use_regional_attention:
+        spatial_masks = create_identity_masks(width, height, identity_regions)
+        token_assignments = _build_attention_token_assignments(
+            pipe.tokenizer, prompt, identities
+        )
+        set_regional_attention(pipe, spatial_masks, token_assignments, mask_self_attention=False)
+
+    generator = torch.Generator(device="cpu").manual_seed(seed + 1)
+    print("[pipeline] Two-stage: STAGE 2 (identity refinement)")
+    print(f"[pipeline]   strength={refine_strength}  ctrl={identity_ctrl_scale}")
+    try:
+        stage2_img = img2img(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            image=stage1_img,
+            control_image=pose_image_resized,
+            controlnet_conditioning_scale=identity_ctrl_scale,
+            strength=refine_strength,
+            num_inference_steps=refine_steps,
+            guidance_scale=guidance_scale,
+            generator=generator,
+            width=width,
+            height=height,
+        ).images[0]
+    finally:
+        if use_regional_attention:
+            remove_regional_attention(pipe)
+        if gate_handles is not None:
+            from lora_gate import remove_spatially_gated_lora
+            remove_spatially_gated_lora(gate_handles)
+
+    return stage1_img, stage2_img
+
+
+# ── face-local identity refinement ───────────────────────────────────
+
+def _expand_bbox(bbox, pad_ratio: float, w: int, h: int) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = bbox
+    bw, bh = x2 - x1, y2 - y1
+    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+    side = max(bw, bh) * (1.0 + pad_ratio)
+    nx1 = max(0, int(cx - side / 2)); ny1 = max(0, int(cy - side / 2))
+    nx2 = min(w, int(cx + side / 2)); ny2 = min(h, int(cy + side / 2))
+    return nx1, ny1, nx2, ny2
+
+
+def _feather_mask(size: tuple[int, int], feather: int = 24) -> Image.Image:
+    """Build a soft-edged white mask the same size as a crop."""
+    from PIL import ImageFilter
+    w, h = size
+    m = Image.new("L", (w, h), 255)
+    if feather <= 0:
+        return m
+    # Shrink slightly then blur, so edges fall off inside the crop
+    inset = Image.new("L", (w, h), 0)
+    from PIL import ImageDraw
+    ImageDraw.Draw(inset).rectangle(
+        [feather, feather, w - feather, h - feather], fill=255
+    )
+    return inset.filter(ImageFilter.GaussianBlur(radius=feather))
+
+
+def face_local_refine(
+    pipe: StableDiffusionXLControlNetPipeline,
+    identities: dict,
+    image: Image.Image,
+    face_scorer,
+    identity_regions: dict,
+    refine_strength: float = 0.45,
+    crop_pad_ratio: float = 0.5,
+    refine_steps: int = 25,
+    seed: int = 42,
+    feather: int = 24,
+) -> Image.Image:
+    """
+    For each detected face, crop, upscale to 1024 if needed, run SDXL img2img
+    using ONLY that identity's LoRA at high scale, downscale back, and
+    feather-blend onto the original image.
+
+    Final cleanup pass: when full-image generation has only-just-distinct
+    faces, this stage replaces each face with a much more faithful version
+    of the right identity, since at the crop level the LoRA is competing
+    with no one.
+    """
+    from diffusers import StableDiffusionXLImg2ImgPipeline
+
+    img2img = StableDiffusionXLImg2ImgPipeline(
+        vae=pipe.vae,
+        text_encoder=pipe.text_encoder,
+        text_encoder_2=pipe.text_encoder_2,
+        tokenizer=pipe.tokenizer,
+        tokenizer_2=pipe.tokenizer_2,
+        unet=pipe.unet,
+        scheduler=pipe.scheduler,
+    )
+
+    adapter_names = list(identities.keys())
+
+    faces = face_scorer.detect_faces(image)
+    assignments = face_scorer.assign_faces_to_identities(faces, identity_regions)
+
+    out = image.copy()
+    for identity_id, face in assignments.items():
+        if face is None:
+            print(f"[face_refine] skip {identity_id} — no face detected")
+            continue
+
+        x1, y1, x2, y2 = _expand_bbox(face["bbox"], crop_pad_ratio, image.width, image.height)
+        crop = out.crop((x1, y1, x2, y2))
+        cw, ch = crop.size
+        crop_hr = crop.resize((1024, 1024), Image.LANCZOS)
+
+        # Activate ONLY this identity's LoRA at high scale
+        weights = [1.4 if k == identity_id else 0.0 for k in adapter_names]
+        pipe.set_adapters(adapter_names, adapter_weights=weights)
+
+        meta = identities[identity_id]
+        prompt = (
+            f"close-up portrait of {meta.get('visual_description', '')}, "
+            f"{meta.get('lora_trigger', '')}, sharp focus, photorealistic"
+        ).strip().strip(",")
+        negative = _BASE_NEGATIVE
+        nf = meta.get("negative_features")
+        if nf:
+            negative = negative + ", " + nf
+
+        generator = torch.Generator(device="cpu").manual_seed(seed + hash(identity_id) % 10_000)
+        print(f"[face_refine] refining {identity_id}: bbox=({x1},{y1},{x2},{y2}) → 1024x1024")
+        new_hr = img2img(
+            prompt=prompt,
+            negative_prompt=negative,
+            image=crop_hr,
+            strength=refine_strength,
+            num_inference_steps=refine_steps,
+            generator=generator,
+        ).images[0]
+
+        new_crop = new_hr.resize((cw, ch), Image.LANCZOS)
+        mask = _feather_mask(new_crop.size, feather=feather)
+        out.paste(new_crop, (x1, y1), mask)
+
+    return out
+
+
 # ── quick test ───────────────────────────────────────────────────────
 
 if __name__ == "__main__":
