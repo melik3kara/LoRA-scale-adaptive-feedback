@@ -19,6 +19,15 @@ identities:
       - "Hermione_Granger"
       - "bushy brown hair"
       - "Hogwarts school robe"
+    # CLIP attribute scoring — positive_attributes should be present in this
+    # identity's region, negative_attributes should be absent. The scorer
+    # returns a margin: clip_sim(pos) - clip_sim(neg), high = identity correct.
+    positive_attributes:
+      - "a young woman with long bushy brown curly hair"
+      - "wearing a black Hogwarts school robe"
+    negative_attributes:
+      - "a woman with platinum silver-white hair"
+      - "wearing a blue medieval royal dress"
 
   daenerys:
     name: "Daenerys Targaryen"
@@ -31,3 +40,9 @@ identities:
       - "dae woman"
       - "platinum silver-white hair"
       - "regal blue dress"
+    positive_attributes:
+      - "a woman with long straight platinum silver-white hair"
+      - "wearing a blue medieval royal dress"
+    negative_attributes:
+      - "a young woman with long bushy brown curly hair"
+      - "wearing a black Hogwarts school robe"

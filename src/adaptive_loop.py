@@ -67,6 +67,11 @@ def multi_lora_adaptive_generate(
     alpha_max: float | dict = 1.0,
     delta_up: float = 0.15,
     delta_down: float = 0.10,
+    delta_suppress: float = 0.07,
+    dominance_threshold: float = 0.0,
+    attribute_scorer=None,
+    attribute_threshold: float = 0.0,
+    delta_attr: float = 0.05,
     max_iters: int = 5,
     seed: int = 42,
     use_regional_attention: bool = False,
@@ -143,6 +148,10 @@ def multi_lora_adaptive_generate(
         # Score
         face_scores = face_scorer.score_image(img, identity_regions)
         pose_scores = pose_scorer.score_image(img, target_keypoints, identity_regions)
+        attr_scores = (
+            attribute_scorer.score_image(img, identity_regions)
+            if attribute_scorer is not None else {}
+        )
         last_face_scores = face_scores
         last_pose_scores = pose_scores
 
@@ -164,31 +173,42 @@ def multi_lora_adaptive_generate(
         # Update each identity's state
         for identity_id in identities:
             state = states[identity_id]
-            arcface_sim = face_scores.get(identity_id, {}).get("arcface", 0.0)
-            pose_sim    = pose_scores.get(identity_id, {}).get("pose",    0.0)
+            face_info  = face_scores.get(identity_id, {}) or {}
+            arcface_sim = face_info.get("arcface",   0.0)
+            dominance   = face_info.get("dominance", 0.0)
+            wrong_winner = face_info.get("wrong_winner")
+            pose_sim    = pose_scores.get(identity_id, {}).get("pose", 0.0)
+
+            attr_margin = attr_scores.get(identity_id, {}).get("margin", None)
 
             state.history.append({
-                "iteration": iteration,
-                "alpha":     state.alpha,
-                "arcface":   arcface_sim,
-                "pose":      pose_sim,
+                "iteration":   iteration,
+                "alpha":       state.alpha,
+                "arcface":     arcface_sim,
+                "dominance":   dominance,
+                "wrong_winner": wrong_winner,
+                "pose":        pose_sim,
+                "attr_margin": attr_margin,
             })
 
-            # Convergence check: both identity and pose must be good.
+            # Convergence check: identity good, pose good, no leakage.
             # pose_sim == 0.0 usually means the pose scorer failed to detect
             # or assign a person — treat it as "unknown" rather than "failed".
-            id_ok   = arcface_sim >= id_threshold
-            pose_ok = pose_sim >= pose_threshold or pose_sim == 0.0
+            id_ok        = arcface_sim >= id_threshold
+            pose_ok      = pose_sim >= pose_threshold or pose_sim == 0.0
+            leakage_ok   = dominance <= dominance_threshold
 
-            if id_ok and pose_ok:
+            if id_ok and pose_ok and leakage_ok:
                 state.converged = True
             else:
                 state.converged = False
 
             if verbose:
                 status = "✓" if state.converged else " "
+                leak = f"  dom={dominance:+.3f}" + (f"←{wrong_winner}" if wrong_winner and dominance > 0 else "")
+                attr_str = f"  attr={attr_margin:+.3f}" if attr_margin is not None else ""
                 print(f"[adaptive]   {status} {identity_id}: "
-                      f"α={state.alpha:.2f}  arcface={arcface_sim:.3f}  pose={pose_sim:.3f}")
+                      f"α={state.alpha:.2f}  arcface={arcface_sim:.3f}  pose={pose_sim:.3f}{leak}{attr_str}")
 
         # Early stop if all converged
         if all(s.converged for s in states.values()):
@@ -196,27 +216,59 @@ def multi_lora_adaptive_generate(
                 print(f"[adaptive] All identities converged at iteration {iteration+1}")
             break
 
-        # Update alphas for unconverged identities
-        # Priority: pose correction (down) overrides identity correction (up)
+        # Update alphas — dominance-aware:
+        # 1) If a wrong identity is winning region i (dominance > 0), suppress
+        #    that wrong identity's α AND boost the correct identity's α.
+        # 2) Otherwise apply the original pose-down / arcface-up logic per id.
+        # Suppression deltas are applied per pair so they accumulate across
+        # all leaking regions.
+        suppress_delta = {k: 0.0 for k in identities}
+        boost_delta    = {k: 0.0 for k in identities}
+
+        for identity_id in identities:
+            face_info = face_scores.get(identity_id, {}) or {}
+            dominance = face_info.get("dominance", 0.0)
+            wrong = face_info.get("wrong_winner")
+            if wrong and dominance > dominance_threshold and wrong in states:
+                # Wrong identity is leaking into this region — suppress wrong, boost correct
+                suppress_delta[wrong]       += delta_suppress
+                boost_delta[identity_id]    += delta_up
+
         for identity_id, state in states.items():
             if state.converged:
                 continue
 
-            arcface_sim = face_scores.get(identity_id, {}).get("arcface", 0.0)
-            pose_sim    = pose_scores.get(identity_id, {}).get("pose",    0.0)
+            face_info  = face_scores.get(identity_id, {}) or {}
+            arcface_sim = face_info.get("arcface", 0.0)
+            pose_sim    = pose_scores.get(identity_id, {}).get("pose", 0.0)
 
             a_min = _resolve(alpha_min, identity_id)
             a_max = _resolve(alpha_max, identity_id)
 
-            # Only trust pose signal when > 0 (0.0 means the scorer gave up).
+            applied_pair_update = (
+                suppress_delta[identity_id] > 0 or boost_delta[identity_id] > 0
+            )
+
+            if applied_pair_update:
+                # Apply dominance-driven adjustments first
+                state.alpha = max(
+                    min(state.alpha + boost_delta[identity_id] - suppress_delta[identity_id], a_max),
+                    a_min,
+                )
+                continue
+
+            # Fall back to original logic when no leakage signal involves this id
             pose_reliable = pose_sim > 0.0
+            attr_margin = attr_scores.get(identity_id, {}).get("margin", None)
 
             if pose_reliable and pose_sim < pose_threshold:
-                # Pose drifted — pull alpha back
                 state.alpha = max(state.alpha - delta_down, a_min)
             elif arcface_sim < id_threshold:
-                # Identity weak — push alpha up
                 state.alpha = min(state.alpha + delta_up, a_max)
+            elif attr_margin is not None and attr_margin < attribute_threshold:
+                # Identity face is OK but visual attributes (hair/attire) are wrong —
+                # nudge alpha up to push the LoRA's stylistic features further.
+                state.alpha = min(state.alpha + delta_attr, a_max)
 
     n_converged = sum(1 for s in states.values() if s.converged)
     if n_converged == len(states):

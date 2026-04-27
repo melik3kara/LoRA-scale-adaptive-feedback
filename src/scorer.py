@@ -207,21 +207,23 @@ class FaceScorer:
         identity_regions: dict,
     ) -> dict:
         """
-        Score a generated multi-identity image.
+        Score a generated multi-identity image with dominance information.
 
-        Detects faces, assigns them to identity regions, and computes ArcFace
-        similarity against reference embeddings.
-
-        Args:
-            image:             The generated PIL image.
-            identity_regions:  {identity_id: (x1, y1, x2, y2)} per identity.
+        For each region, computes similarity against the assigned identity's
+        reference (`arcface`) AND against every other identity's reference
+        (`cross_sims`). The `dominance` field is the gap between the strongest
+        wrong-identity similarity and the self-similarity — positive values
+        mean a different identity is winning in this region (leakage).
 
         Returns:
             {
                 identity_id: {
-                    "arcface": float (cosine similarity, -1 to 1),
-                    "detected": bool,
-                    "bbox": (x1, y1, x2, y2) or None,
+                    "arcface":    float (self similarity, -1 to 1),
+                    "cross_sims": {other_id: float, ...},
+                    "dominance":  float (max(cross_sims) - arcface),
+                    "wrong_winner": str | None (id of strongest cross identity),
+                    "detected":   bool,
+                    "bbox":       (x1, y1, x2, y2) or None,
                 },
                 ...
             }
@@ -234,6 +236,9 @@ class FaceScorer:
             if face is None:
                 scores[identity_id] = {
                     "arcface": 0.0,
+                    "cross_sims": {},
+                    "dominance": 0.0,
+                    "wrong_winner": None,
                     "detected": False,
                     "bbox": None,
                 }
@@ -244,16 +249,36 @@ class FaceScorer:
             if ref_emb is None:
                 scores[identity_id] = {
                     "arcface": 0.0,
+                    "cross_sims": {},
+                    "dominance": 0.0,
+                    "wrong_winner": None,
                     "detected": True,
                     "bbox": face["bbox"],
                 }
                 print(f"[scorer] WARNING: No reference embedding for '{identity_id}'")
                 continue
 
-            sim = self.cosine_similarity(face["embedding"], ref_emb)
+            self_sim = self.cosine_similarity(face["embedding"], ref_emb)
+
+            # Cross-similarity against every OTHER identity's reference
+            cross_sims = {}
+            for other_id, other_emb in self.reference_embeddings.items():
+                if other_id == identity_id:
+                    continue
+                cross_sims[other_id] = self.cosine_similarity(face["embedding"], other_emb)
+
+            if cross_sims:
+                wrong_winner = max(cross_sims, key=cross_sims.get)
+                dominance = cross_sims[wrong_winner] - self_sim
+            else:
+                wrong_winner = None
+                dominance = 0.0
 
             scores[identity_id] = {
-                "arcface": sim,
+                "arcface": self_sim,
+                "cross_sims": cross_sims,
+                "dominance": dominance,
+                "wrong_winner": wrong_winner,
                 "detected": True,
                 "bbox": face["bbox"],
             }
