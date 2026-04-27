@@ -72,9 +72,11 @@ def multi_lora_adaptive_generate(
     attribute_scorer=None,
     attribute_threshold: float = 0.0,
     delta_attr: float = 0.05,
+    block_profile: dict | None = None,
     max_iters: int = 5,
     seed: int = 42,
     use_regional_attention: bool = False,
+    use_spatial_lora_gate: bool = False,
     verbose: bool = True,
 ) -> AdaptiveResult:
     """
@@ -126,9 +128,19 @@ def multi_lora_adaptive_generate(
     best_face_scores = {}
     best_pose_scores = {}
 
+    def _scaled_for(identity_id: str, alpha: float):
+        """Apply block_profile (if any) as a per-block multiplier on alpha."""
+        if block_profile is None or identity_id not in block_profile:
+            return alpha
+        return {
+            block: alpha * ratio
+            for block, ratio in block_profile[identity_id].items()
+        }
+
     for iteration in range(max_iters):
-        # Build per-identity LoRA scales from current state
-        lora_scales = {k: states[k].alpha for k in identities}
+        # Build per-identity LoRA scales from current state — apply block
+        # profile so a single adaptive scalar drives layer-wise routing.
+        lora_scales = {k: _scaled_for(k, states[k].alpha) for k in identities}
 
         if verbose:
             alpha_str = "  ".join(f"{k}={states[k].alpha:.2f}" for k in identities)
@@ -141,6 +153,7 @@ def multi_lora_adaptive_generate(
             ctrl_scale=ctrl_scale,
             seed=seed,
             use_regional_attention=use_regional_attention,
+            use_spatial_lora_gate=use_spatial_lora_gate,
             identity_regions=identity_regions,
         )
         last_image = img
@@ -314,6 +327,7 @@ def run_adaptive_best_of_n(
     identity_regions: dict,
     seeds: list,
     use_regional_attention: bool = True,
+    use_spatial_lora_gate: bool = False,
     verbose: bool = True,
     **adaptive_kwargs,
 ) -> AdaptiveResult:
@@ -346,6 +360,7 @@ def run_adaptive_best_of_n(
             face_scorer, pose_scorer, target_keypoints, identity_regions,
             seed=seed,
             use_regional_attention=use_regional_attention,
+            use_spatial_lora_gate=use_spatial_lora_gate,
             verbose=verbose,
             **adaptive_kwargs,
         )

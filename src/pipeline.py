@@ -31,6 +31,36 @@ def _find_phrase_token_indices(tokenizer, prompt: str, phrase: str) -> list[int]
     return indices
 
 
+def _to_peft_scale(scale):
+    """
+    Convert a user-facing LoRA scale into the format diffusers/PEFT
+    `set_adapters` expects per adapter.
+
+    Accepts:
+      - float            → returned as-is
+      - {"down": 0.1, "mid": 0.2, "up": 0.3, "text_encoder": 0.0}
+                          (short keys; mapped to UNet block prefixes)
+      - {"down_blocks": ..., "mid_block": ..., "up_blocks": ..., "text_encoder": ...}
+                          (long keys; passed through)
+
+    Short keys are translated so the user-facing config stays compact while
+    we still hand PEFT the regex-matchable prefixes it requires.
+    """
+    if not isinstance(scale, dict):
+        return float(scale)
+
+    KEY_MAP = {
+        "down": "down_blocks",
+        "mid":  "mid_block",
+        "up":   "up_blocks",
+        "te":   "text_encoder",
+    }
+    out = {}
+    for k, v in scale.items():
+        out[KEY_MAP.get(k, k)] = float(v)
+    return out
+
+
 def _build_attention_token_assignments(
     tokenizer,
     prompt: str,
@@ -229,6 +259,7 @@ def generate(
     use_regional_attention: bool = False,
     identity_regions: dict | None = None,
     guidance_scale: float = 7.5,
+    use_spatial_lora_gate: bool = False,
 ) -> Image.Image:
     """
     Generate a multi-identity image.
@@ -249,10 +280,17 @@ def generate(
     """
     adapter_names = list(identities.keys())
 
-    # Set per-identity LoRA scales
+    # Set per-identity LoRA scales — supports two formats:
+    #   1) Flat scalar: {"hermione": 0.7, "daenerys": 0.5}
+    #   2) Block-wise dict per identity:
+    #        {"hermione": {"down": 0.1, "mid": 0.2, "up": 0.35},
+    #         "daenerys": {"down": 0.5, "mid": 1.2, "up": 1.5}}
+    # Block-wise scales let the loop weaken a dominant LoRA in early UNet
+    # blocks (which control composition) while keeping it active in later
+    # blocks (which control face/texture detail).
     if lora_scales is None:
         lora_scales = {k: 0.8 for k in adapter_names}
-    adapter_weights = [lora_scales.get(k, 0.8) for k in adapter_names]
+    adapter_weights = [_to_peft_scale(lora_scales.get(k, 0.8)) for k in adapter_names]
     pipe.set_adapters(adapter_names, adapter_weights=adapter_weights)
 
     # Resolve identity regions early so prompt construction can use them
@@ -291,6 +329,16 @@ def generate(
 
     generator = torch.Generator(device="cpu").manual_seed(seed)
 
+    # Spatially gate LoRA residuals so each identity's contribution is
+    # restricted to its own region throughout the UNet — this is the
+    # mechanism, not just attention masking, that keeps identities apart.
+    gate_handles = None
+    if use_spatial_lora_gate and identity_regions is not None:
+        from lora_gate import set_spatially_gated_lora
+        gate_masks = create_identity_masks(width, height, identity_regions)
+        # Latent space at SDXL is /8 of pixel; pick the largest internal mask
+        gate_handles = set_spatially_gated_lora(pipe, gate_masks, latent_size=height // 8)
+
     try:
         image = pipe(
             prompt=prompt,
@@ -306,6 +354,9 @@ def generate(
     finally:
         if use_regional_attention:
             remove_regional_attention(pipe)
+        if gate_handles is not None:
+            from lora_gate import remove_spatially_gated_lora
+            remove_spatially_gated_lora(gate_handles)
 
     return image
 
