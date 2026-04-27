@@ -149,8 +149,15 @@ def _patched_lora_forward(original_forward, lora_layer, mask_pyramid):
 
             lora_A   = lora_layer.lora_A[adapter]
             lora_B   = lora_layer.lora_B[adapter]
-            dropout  = lora_layer.lora_dropout.get(adapter, torch.nn.Identity())
-            scaling  = lora_layer.scaling.get(adapter, 1.0)
+            # lora_dropout is an nn.ModuleDict (no .get); scaling is a plain dict
+            dropout  = (
+                lora_layer.lora_dropout[adapter]
+                if adapter in lora_layer.lora_dropout
+                else torch.nn.Identity()
+            )
+            scaling  = lora_layer.scaling.get(adapter, 1.0) if isinstance(
+                lora_layer.scaling, dict
+            ) else 1.0
 
             try:
                 delta = lora_B(lora_A(dropout(x))) * scaling
