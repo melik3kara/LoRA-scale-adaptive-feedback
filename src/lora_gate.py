@@ -36,13 +36,23 @@ import torch
 import torch.nn.functional as F
 
 
-def _build_mask_pyramid(identity_masks: dict, latent_size: int = 128) -> dict:
+def _build_mask_pyramid(
+    identity_masks: dict,
+    latent_size: int = 128,
+    feather_ratio: float = 0.06,
+    floor: float = 0.15,
+) -> dict:
     """
     Build a multi-resolution pyramid of each identity's spatial mask.
     Keys are (h, w) tuples; values are float tensors with shape (1, 1, h, w).
 
-    The latent_size argument is the highest-resolution mask cached. UNet
-    activations at lower resolutions get sampled via interpolate at lookup time.
+    Hard 0/1 masks at half-image boundaries cause a "diptych" artifact —
+    two regions appear as glued-together separate images with mismatched
+    lighting/background. Two softeners:
+      - feather_ratio: Gaussian-blur the mask with sigma = ratio * latent_size
+        so the boundary is a smooth transition rather than a step.
+      - floor: minimum mask value so the rival LoRA still has a small
+        contribution everywhere, helping the two halves blend stylistically.
     """
     pyramid = {}
     for ident, mask in identity_masks.items():
@@ -58,6 +68,23 @@ def _build_mask_pyramid(identity_masks: dict, latent_size: int = 128) -> dict:
         # Resize to latent_size base
         if t.shape[-2:] != (latent_size, latent_size):
             t = F.interpolate(t, size=(latent_size, latent_size), mode="bilinear", align_corners=False)
+
+        # Feather the boundary with a Gaussian blur kernel
+        if feather_ratio > 0:
+            sigma = max(1.0, feather_ratio * latent_size)
+            ksize = int(2 * round(2 * sigma) + 1)
+            # Build separable 1D Gaussian kernel and apply twice (h then w)
+            xs = torch.arange(ksize, dtype=torch.float32) - (ksize - 1) / 2
+            g = torch.exp(-(xs ** 2) / (2 * sigma ** 2))
+            g = (g / g.sum()).view(1, 1, 1, ksize)
+            pad = ksize // 2
+            t = F.conv2d(F.pad(t, (pad, pad, 0, 0), mode="replicate"), g)
+            t = F.conv2d(F.pad(t, (0, 0, pad, pad), mode="replicate"), g.transpose(2, 3))
+
+        # Apply floor — never fully zero out, blend stylistically
+        if floor > 0:
+            t = floor + (1.0 - floor) * t.clamp(0.0, 1.0)
+
         pyramid[ident] = t
     return pyramid
 
@@ -178,7 +205,13 @@ def _patched_lora_forward(original_forward, lora_layer, mask_pyramid):
     return forward
 
 
-def set_spatially_gated_lora(pipe, identity_masks: dict, latent_size: int = 128) -> list:
+def set_spatially_gated_lora(
+    pipe,
+    identity_masks: dict,
+    latent_size: int = 128,
+    feather_ratio: float = 0.06,
+    floor: float = 0.15,
+) -> list:
     """
     Patch every PEFT LoRA layer in the UNet so its residual is multiplied by
     each identity's spatial mask. Returns a list of (module, original_forward)
