@@ -663,6 +663,129 @@ def face_local_refine(
     return out
 
 
+# ── hair-specific refinement (DARF v6) ───────────────────────────────
+
+def _expand_bbox_for_hair(
+    bbox, image_w, image_h,
+    horiz_pad: float = 0.6,
+    up_pad: float = 1.6,
+    down_pad: float = 0.2,
+) -> tuple[int, int, int, int]:
+    """
+    Asymmetrically expand a face bbox to capture hair: extend MORE upward
+    (where hair sits) and a bit to the sides, less downward. Default ratios
+    grow up by 1.6x bbox height (typical hair extends well above the head)
+    and laterally by 0.6x face width.
+    """
+    x1, y1, x2, y2 = bbox
+    bw, bh = x2 - x1, y2 - y1
+    nx1 = max(0, int(x1 - bw * horiz_pad))
+    nx2 = min(image_w, int(x2 + bw * horiz_pad))
+    ny1 = max(0, int(y1 - bh * up_pad))     # ← much more upward
+    ny2 = min(image_h, int(y2 + bh * down_pad))
+    return nx1, ny1, nx2, ny2
+
+
+def hair_local_refine(
+    pipe: StableDiffusionXLControlNetPipeline,
+    identities: dict,
+    image: Image.Image,
+    face_scorer,
+    identity_regions: dict,
+    refine_strength: float = 0.55,
+    refine_steps: int = 28,
+    seed: int = 42,
+    feather: int = 36,
+    horiz_pad: float = 0.6,
+    up_pad: float = 1.6,
+    down_pad: float = 0.2,
+    lora_alpha: float = 1.6,
+) -> Image.Image:
+    """
+    Same idea as face_local_refine but the crop is asymmetrically expanded
+    upward and laterally to include the hair, and the prompt + LoRA scaling
+    are tuned to refine HAIR rather than face geometry.
+
+    Useful when face_local_refine has already restored the right identity's
+    facial features but the hair colour/texture still inherits from the
+    rival LoRA's leakage (e.g. Daenerys keeping a brownish tint).
+    """
+    from diffusers import StableDiffusionXLImg2ImgPipeline
+
+    img2img = StableDiffusionXLImg2ImgPipeline(
+        vae=pipe.vae,
+        text_encoder=pipe.text_encoder,
+        text_encoder_2=pipe.text_encoder_2,
+        tokenizer=pipe.tokenizer,
+        tokenizer_2=pipe.tokenizer_2,
+        unet=pipe.unet,
+        scheduler=pipe.scheduler,
+    )
+
+    adapter_names = list(identities.keys())
+    faces = face_scorer.detect_faces(image)
+    assignments = face_scorer.assign_faces_to_identities(faces, identity_regions)
+
+    out = image.copy()
+    for identity_id, face in assignments.items():
+        if face is None:
+            print(f"[hair_refine] skip {identity_id} — no face detected")
+            continue
+
+        x1, y1, x2, y2 = _expand_bbox_for_hair(
+            face["bbox"], image.width, image.height,
+            horiz_pad=horiz_pad, up_pad=up_pad, down_pad=down_pad,
+        )
+        crop = out.crop((x1, y1, x2, y2))
+        cw, ch = crop.size
+        crop_hr = crop.resize((1024, 1024), Image.LANCZOS)
+
+        # Sole LoRA at very high alpha for hair texture
+        weights = [lora_alpha if k == identity_id else 0.0 for k in adapter_names]
+        pipe.set_adapters(adapter_names, adapter_weights=weights)
+
+        meta = identities[identity_id]
+        # Hair-focused prompt — emphasise hair attributes, then identity
+        hair_phrases = []
+        for ph in meta.get("attention_phrases", []):
+            if "hair" in ph.lower():
+                hair_phrases.append(ph)
+        if not hair_phrases:
+            hair_phrases = [meta.get("visual_description", "")]
+        hair_text = ", ".join(hair_phrases)
+
+        prompt = (
+            f"close-up portrait emphasising hair texture, {hair_text}, "
+            f"{meta.get('lora_trigger', '')}, "
+            f"natural lighting, sharp focus, photorealistic"
+        ).strip().strip(",")
+
+        negative = _BASE_NEGATIVE
+        nf = meta.get("negative_features")
+        if nf:
+            negative = negative + ", " + nf
+
+        generator = torch.Generator(device="cpu").manual_seed(seed + hash(identity_id) % 10_000)
+        print(
+            f"[hair_refine] {identity_id}: bbox=({x1},{y1},{x2},{y2}) "
+            f"→ 1024x1024  α={lora_alpha}  strength={refine_strength}"
+        )
+        new_hr = img2img(
+            prompt=prompt,
+            negative_prompt=negative,
+            image=crop_hr,
+            strength=refine_strength,
+            num_inference_steps=refine_steps,
+            generator=generator,
+        ).images[0]
+
+        new_crop = new_hr.resize((cw, ch), Image.LANCZOS)
+        mask = _feather_mask(new_crop.size, feather=feather)
+        out.paste(new_crop, (x1, y1), mask)
+
+    return out
+
+
 # ── quick test ───────────────────────────────────────────────────────
 
 if __name__ == "__main__":
