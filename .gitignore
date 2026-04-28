@@ -8,3 +8,13 @@ data/loras/*.ckpt
 __pycache__/
 *.pyc
 .env
+
+# User-downloaded results / pod artifacts
+darf_v1_results/
+darf_v2_results/
+*.zip
+data/results/
+
+# Evaluator copy at repo root (canonical lives in src/)
+/evaluator.py
+/Untitled-*.ipynb
