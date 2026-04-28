@@ -3,31 +3,48 @@ import numpy as np
 from PIL import Image
 from insightface.app import FaceAnalysis
 from scipy.optimize import linear_sum_assignment
-import mediapipe as mp
+
+# MediaPipe is optional. Newer versions of mediapipe removed the legacy
+# `mp.solutions` API in favour of `mp.tasks`. We try the legacy import
+# first and silently fall back to None so ArcFace metrics still work.
+try:
+    import mediapipe as mp
+    _MP_POSE = mp.solutions.pose if hasattr(mp, "solutions") else None
+except Exception:
+    mp = None
+    _MP_POSE = None
+
 
 class Evaluator:
     """
     Evaluates face identity similarity and pose keypoint error.
+
+    pose_keypoint_error requires MediaPipe with the legacy `solutions` API
+    (mediapipe <= 0.10.x). If MediaPipe is missing or too new, that method
+    becomes a no-op returning 0.0; ArcFace methods continue to work.
     """
     def __init__(self, device="cuda"):
         self.device = device
-        
-        # InsightFace for face detection and arcface embeddings
+
         print("Initializing InsightFace for Evaluator...")
         self.face_app = FaceAnalysis(
             providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
-            # By not specifying allowed_modules, it loads both detection and recognition
         )
         self.face_app.prepare(ctx_id=0, det_size=(640, 640))
-        
-        # MediaPipe for pose evaluation
-        print("Initializing MediaPipe for Evaluator...")
-        self.mp_pose = mp.solutions.pose
-        self.pose_detector = self.mp_pose.Pose(
-            static_image_mode=True, 
-            model_complexity=2, 
-            min_detection_confidence=0.5
-        )
+
+        if _MP_POSE is not None:
+            print("Initializing MediaPipe for Evaluator...")
+            self.mp_pose = _MP_POSE
+            self.pose_detector = self.mp_pose.Pose(
+                static_image_mode=True,
+                model_complexity=2,
+                min_detection_confidence=0.5,
+            )
+        else:
+            print("[Evaluator] MediaPipe legacy API not available — pose_keypoint_error disabled.")
+            print("[Evaluator] To enable: pip install 'mediapipe==0.10.14' and restart kernel.")
+            self.mp_pose = None
+            self.pose_detector = None
 
     def extract_face_embedding(self, img_pil: Image.Image) -> np.ndarray:
         """Extract normalized ArcFace embedding for the largest face in an image."""
@@ -82,20 +99,23 @@ class Evaluator:
         
     def pose_keypoint_error(self, output_img_pil: Image.Image, pose_reference_pil: Image.Image) -> float:
         """
-        Calculates mean L2 distance between normalized pose keypoints of output and reference.
+        Mean L2 distance between normalized pose keypoints of output and reference.
+        Returns 0.0 if MediaPipe is unavailable (so calling code stays generic).
         """
+        if self.pose_detector is None:
+            return 0.0
+
         out_arr = np.array(output_img_pil.convert("RGB"))
         ref_arr = np.array(pose_reference_pil.convert("RGB"))
-        
+
         out_results = self.pose_detector.process(out_arr)
         ref_results = self.pose_detector.process(ref_arr)
-        
+
         if not out_results.pose_landmarks or not ref_results.pose_landmarks:
-            return 1.0 # Max error if pose not found in either image
-            
+            return 1.0  # Max error if pose not found in either image
+
         out_kps = np.array([[lm.x, lm.y] for lm in out_results.pose_landmarks.landmark])
         ref_kps = np.array([[lm.x, lm.y] for lm in ref_results.pose_landmarks.landmark])
-        
-        # Calculate mean L2 distance across all 33 landmarks
+
         error = np.linalg.norm(out_kps - ref_kps, axis=1).mean()
         return float(error)
