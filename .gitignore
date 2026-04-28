@@ -18,3 +18,7 @@ data/results/
 # Evaluator copy at repo root (canonical lives in src/)
 /evaluator.py
 /Untitled-*.ipynb
+
+# v4/v5 result dirs
+darf_*_results/
+darf_*_results.zip
