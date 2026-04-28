@@ -411,6 +411,14 @@ def generate_two_stage(
     use_spatial_lora_gate: bool = True,
     identity_regions: dict | None = None,
     guidance_scale: float = 7.5,
+    spatial_gate_block_floor: dict | None = None,
+    spatial_gate_floor: float = 0.05,
+    spatial_gate_feather_ratio: float = 0.05,
+    use_bg_lock: bool = False,
+    bg_lock_ratio: float = 0.35,
+    bg_lock_padding: int = 0,
+    bg_lock_in_layout: bool = True,
+    bg_lock_in_identity: bool = False,
     **_unused,
 ) -> tuple[Image.Image, Image.Image]:
     """
@@ -444,6 +452,11 @@ def generate_two_stage(
         use_spatial_lora_gate=False,
         identity_regions=identity_regions,
         guidance_scale=guidance_scale,
+        # BG lock at layout stage: kills third-person hallucination before
+        # any identity LoRA gets meaningful weight.
+        use_bg_lock=(use_bg_lock and bg_lock_in_layout),
+        bg_lock_ratio=bg_lock_ratio,
+        bg_lock_padding=bg_lock_padding,
     )
 
     # Stage 2 — identity refinement via ControlNet img2img on stage-1 output.
@@ -481,7 +494,13 @@ def generate_two_stage(
     if use_spatial_lora_gate and identity_regions is not None:
         from lora_gate import set_spatially_gated_lora
         gate_masks = create_identity_masks(width, height, identity_regions)
-        gate_handles = set_spatially_gated_lora(pipe, gate_masks, latent_size=height // 8)
+        gate_handles = set_spatially_gated_lora(
+            pipe, gate_masks,
+            latent_size=height // 8,
+            feather_ratio=spatial_gate_feather_ratio,
+            floor=spatial_gate_floor,
+            block_floor=spatial_gate_block_floor,
+        )
 
     if use_regional_attention:
         spatial_masks = create_identity_masks(width, height, identity_regions)
@@ -490,23 +509,40 @@ def generate_two_stage(
         )
         set_regional_attention(pipe, spatial_masks, token_assignments, mask_self_attention=False)
 
+    # BG lock for the identity refinement stage (img2img). Optional — by
+    # default disabled because at refinement stage the foreground is already
+    # well-formed and the lock can blur edges.
+    stage2_callback = None
+    stage2_callback_inputs = None
+    if use_bg_lock and bg_lock_in_identity and identity_regions is not None:
+        from bg_latent_lock import make_bg_lock_callback, regions_to_union_mask
+        union = regions_to_union_mask(identity_regions, width, height, padding=bg_lock_padding)
+        stage2_callback = make_bg_lock_callback(
+            union, total_steps=refine_steps, lock_ratio=bg_lock_ratio,
+        )
+        stage2_callback_inputs = ["latents"]
+
     generator = torch.Generator(device="cpu").manual_seed(seed + 1)
     print("[pipeline] Two-stage: STAGE 2 (identity refinement)")
     print(f"[pipeline]   strength={refine_strength}  ctrl={identity_ctrl_scale}")
+    img2img_kwargs = dict(
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        image=stage1_img,
+        control_image=pose_image_resized,
+        controlnet_conditioning_scale=identity_ctrl_scale,
+        strength=refine_strength,
+        num_inference_steps=refine_steps,
+        guidance_scale=guidance_scale,
+        generator=generator,
+        width=width,
+        height=height,
+    )
+    if stage2_callback is not None:
+        img2img_kwargs["callback_on_step_end"] = stage2_callback
+        img2img_kwargs["callback_on_step_end_tensor_inputs"] = stage2_callback_inputs
     try:
-        stage2_img = img2img(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            image=stage1_img,
-            control_image=pose_image_resized,
-            controlnet_conditioning_scale=identity_ctrl_scale,
-            strength=refine_strength,
-            num_inference_steps=refine_steps,
-            guidance_scale=guidance_scale,
-            generator=generator,
-            width=width,
-            height=height,
-        ).images[0]
+        stage2_img = img2img(**img2img_kwargs).images[0]
     finally:
         if use_regional_attention:
             remove_regional_attention(pipe)

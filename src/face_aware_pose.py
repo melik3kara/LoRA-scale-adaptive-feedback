@@ -48,11 +48,86 @@ FACE_LINE_WIDTH = 3
 KEYPOINT_RADIUS_FACE = 8     # face dots bigger than body
 KEYPOINT_RADIUS_BODY = 5
 
+# Dense face structure — extra detail beyond the 18-keypoint COCO standard.
+# Drawn as faint lines/arcs to give ControlNet stronger "front-facing face"
+# evidence. Generated procedurally from existing nose/eye/ear keypoints.
+DENSE_FACE_COLOR = (220, 200, 200)
+DENSE_FACE_WIDTH = 2
+
+
+def _draw_dense_face(draw: ImageDraw.ImageDraw, kps_px: list) -> None:
+    """
+    Draw extra face structure (jawline, brows, mouth, nose bridge) procedurally
+    from the COCO-18 keypoints (nose=0, r_eye=14, l_eye=15, r_ear=16, l_ear=17,
+    neck=1). All points are derived geometrically — no extra inputs needed.
+    """
+    nose   = kps_px[0]
+    neck   = kps_px[1]
+    r_eye  = kps_px[14]
+    l_eye  = kps_px[15]
+    r_ear  = kps_px[16]
+    l_ear  = kps_px[17]
+
+    # Eye level → above for brows, below for mouth
+    eye_y    = (r_eye[1] + l_eye[1]) // 2
+    face_w   = abs(l_ear[0] - r_ear[0])
+    face_h   = max(int(face_w * 1.2), 1)
+    face_cx  = (r_ear[0] + l_ear[0]) // 2
+    chin_y   = eye_y + int(face_h * 0.6)
+    mouth_y  = eye_y + int(face_h * 0.35)
+
+    # ── Jawline arc (ear → chin → ear) approximated as 5-segment polyline
+    jaw_pts = [
+        r_ear,
+        (r_ear[0] + int(face_w * 0.10), eye_y + int(face_h * 0.30)),
+        (face_cx - int(face_w * 0.10), chin_y),
+        (face_cx + int(face_w * 0.10), chin_y),
+        (l_ear[0] - int(face_w * 0.10), eye_y + int(face_h * 0.30)),
+        l_ear,
+    ]
+    for a, b in zip(jaw_pts[:-1], jaw_pts[1:]):
+        draw.line([a, b], fill=DENSE_FACE_COLOR, width=DENSE_FACE_WIDTH)
+
+    # ── Eyebrows (short lines just above each eye)
+    brow_dx = max(int(face_w * 0.06), 6)
+    brow_dy = max(int(face_h * 0.08), 4)
+    for eye in (r_eye, l_eye):
+        draw.line(
+            [(eye[0] - brow_dx, eye[1] - brow_dy),
+             (eye[0] + brow_dx, eye[1] - brow_dy)],
+            fill=DENSE_FACE_COLOR, width=DENSE_FACE_WIDTH,
+        )
+
+    # ── Mouth (horizontal line below the nose)
+    mouth_w = max(int(face_w * 0.22), 8)
+    draw.line(
+        [(face_cx - mouth_w, mouth_y), (face_cx + mouth_w, mouth_y)],
+        fill=DENSE_FACE_COLOR, width=DENSE_FACE_WIDTH,
+    )
+    # Mouth corners as small dots so the line isn't ambiguous
+    for dx in (-mouth_w, mouth_w):
+        draw.ellipse(
+            [face_cx + dx - 2, mouth_y - 2, face_cx + dx + 2, mouth_y + 2],
+            fill=DENSE_FACE_COLOR,
+        )
+
+    # ── Nose bridge (eye-line midpoint → nose) and nose tip ticks
+    eye_mid = ((r_eye[0] + l_eye[0]) // 2, (r_eye[1] + l_eye[1]) // 2)
+    draw.line([eye_mid, nose], fill=DENSE_FACE_COLOR, width=DENSE_FACE_WIDTH)
+    # Nostril hint — two small dots flanking nose tip
+    nost_dx = max(int(face_w * 0.04), 4)
+    for dx in (-nost_dx, nost_dx):
+        draw.ellipse(
+            [nose[0] + dx - 2, nose[1] - 2, nose[0] + dx + 2, nose[1] + 2],
+            fill=DENSE_FACE_COLOR,
+        )
+
 
 def make_face_aware_pose(
     width: int = 1024,
     height: int = 1024,
     front_facing: bool = True,
+    dense_face: bool = False,
 ) -> Image.Image:
     """
     Draw a 2-person OpenPose skeleton with explicit face structure lines.
@@ -90,6 +165,10 @@ def make_face_aware_pose(
                 fill=FACE_LINE_COLOR,
                 width=FACE_LINE_WIDTH,
             )
+
+        # Optional dense face structure (jawline, brows, mouth, nose bridge)
+        if dense_face:
+            _draw_dense_face(draw, kps_px)
 
         # Keypoints — face larger than body to dominate the local signal
         face_idx = {0, 14, 15, 16, 17}
