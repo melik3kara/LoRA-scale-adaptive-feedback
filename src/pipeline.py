@@ -260,6 +260,12 @@ def generate(
     identity_regions: dict | None = None,
     guidance_scale: float = 7.5,
     use_spatial_lora_gate: bool = False,
+    spatial_gate_block_floor: dict | None = None,
+    spatial_gate_floor: float = 0.05,
+    spatial_gate_feather_ratio: float = 0.05,
+    use_bg_lock: bool = False,
+    bg_lock_ratio: float = 0.35,
+    bg_lock_padding: int = 0,
 ) -> Image.Image:
     """
     Generate a multi-identity image.
@@ -336,21 +342,44 @@ def generate(
     if use_spatial_lora_gate and identity_regions is not None:
         from lora_gate import set_spatially_gated_lora
         gate_masks = create_identity_masks(width, height, identity_regions)
-        # Latent space at SDXL is /8 of pixel; pick the largest internal mask
-        gate_handles = set_spatially_gated_lora(pipe, gate_masks, latent_size=height // 8)
+        gate_handles = set_spatially_gated_lora(
+            pipe, gate_masks,
+            latent_size=height // 8,
+            feather_ratio=spatial_gate_feather_ratio,
+            floor=spatial_gate_floor,
+            block_floor=spatial_gate_block_floor,
+        )
+
+    # Background latent lock — freeze background of latent for first
+    # bg_lock_ratio of denoising steps to prevent third-person hallucination.
+    bg_callback = None
+    bg_callback_inputs = None
+    if use_bg_lock and identity_regions is not None:
+        from bg_latent_lock import make_bg_lock_callback, regions_to_union_mask
+        union = regions_to_union_mask(identity_regions, width, height, padding=bg_lock_padding)
+        bg_callback = make_bg_lock_callback(
+            union, total_steps=num_inference_steps, lock_ratio=bg_lock_ratio,
+        )
+        bg_callback_inputs = ["latents"]
+        print(f"[pipeline] BG latent lock: first {int(num_inference_steps * bg_lock_ratio)}/{num_inference_steps} steps")
+
+    pipe_kwargs = dict(
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        image=pose_image_resized,
+        controlnet_conditioning_scale=ctrl_scale,
+        generator=generator,
+        num_inference_steps=num_inference_steps,
+        guidance_scale=guidance_scale,
+        width=width,
+        height=height,
+    )
+    if bg_callback is not None:
+        pipe_kwargs["callback_on_step_end"] = bg_callback
+        pipe_kwargs["callback_on_step_end_tensor_inputs"] = bg_callback_inputs
 
     try:
-        image = pipe(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            image=pose_image_resized,
-            controlnet_conditioning_scale=ctrl_scale,
-            generator=generator,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            width=width,
-            height=height,
-        ).images[0]
+        image = pipe(**pipe_kwargs).images[0]
     finally:
         if use_regional_attention:
             remove_regional_attention(pipe)
