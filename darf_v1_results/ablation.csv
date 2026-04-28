@@ -1,0 +1,11 @@
+method,identity,arcface,dominance,pose,attr_margin,eval_arcface,eval_pose_err
+baseline,hermione,0.1208,-0.1556,0.8986,0.0176,0.1208,1.0
+baseline,daenerys,0.0313,0.0871,0.1997,0.031,0.2743,1.0
+A: dominance+attr,hermione,0.1369,-0.1521,0.9123,0.008,0.1702,1.0
+A: dominance+attr,daenerys,0.0471,0.1231,0.1993,0.0245,0.2111,1.0
+B: A + spatial gate + layer-α,hermione,0.3732,-0.3362,0.8598,0.0257,0.3732,1.0
+B: A + spatial gate + layer-α,daenerys,0.1074,-0.1133,0.6869,0.03,0.1797,1.0
+C: two-stage,hermione,0.4873,-0.4554,0.4251,0.0114,0.4873,1.0
+C: two-stage,daenerys,-0.0265,0.1089,0.3205,0.0258,0.2743,1.0
+D: C + face refine,hermione,0.594,-0.526,0.8598,0.0257,0.594,1.0
+D: C + face refine,daenerys,0.2559,-0.273,0.322,0.03,0.2559,1.0

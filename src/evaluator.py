@@ -112,7 +112,10 @@ class Evaluator:
         ref_results = self.pose_detector.process(ref_arr)
 
         if not out_results.pose_landmarks or not ref_results.pose_landmarks:
-            return 1.0  # Max error if pose not found in either image
+            # Common case: pose_reference is a stylized skeleton (not a real
+            # photo) and MediaPipe cannot detect a person. Return None-like
+            # signal (NaN) so callers can ignore rather than treat as max-error.
+            return float("nan")
 
         out_kps = np.array([[lm.x, lm.y] for lm in out_results.pose_landmarks.landmark])
         ref_kps = np.array([[lm.x, lm.y] for lm in ref_results.pose_landmarks.landmark])
