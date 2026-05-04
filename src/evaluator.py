@@ -3,48 +3,31 @@ import numpy as np
 from PIL import Image
 from insightface.app import FaceAnalysis
 from scipy.optimize import linear_sum_assignment
-
-# MediaPipe is optional. Newer versions of mediapipe removed the legacy
-# `mp.solutions` API in favour of `mp.tasks`. We try the legacy import
-# first and silently fall back to None so ArcFace metrics still work.
-try:
-    import mediapipe as mp
-    _MP_POSE = mp.solutions.pose if hasattr(mp, "solutions") else None
-except Exception:
-    mp = None
-    _MP_POSE = None
-
+import mediapipe as mp
 
 class Evaluator:
     """
     Evaluates face identity similarity and pose keypoint error.
-
-    pose_keypoint_error requires MediaPipe with the legacy `solutions` API
-    (mediapipe <= 0.10.x). If MediaPipe is missing or too new, that method
-    becomes a no-op returning 0.0; ArcFace methods continue to work.
     """
     def __init__(self, device="cuda"):
         self.device = device
-
+        
+        # InsightFace for face detection and arcface embeddings
         print("Initializing InsightFace for Evaluator...")
         self.face_app = FaceAnalysis(
             providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+            # By not specifying allowed_modules, it loads both detection and recognition
         )
         self.face_app.prepare(ctx_id=0, det_size=(640, 640))
-
-        if _MP_POSE is not None:
-            print("Initializing MediaPipe for Evaluator...")
-            self.mp_pose = _MP_POSE
-            self.pose_detector = self.mp_pose.Pose(
-                static_image_mode=True,
-                model_complexity=2,
-                min_detection_confidence=0.5,
-            )
-        else:
-            print("[Evaluator] MediaPipe legacy API not available — pose_keypoint_error disabled.")
-            print("[Evaluator] To enable: pip install 'mediapipe==0.10.14' and restart kernel.")
-            self.mp_pose = None
-            self.pose_detector = None
+        
+        # MediaPipe for pose evaluation
+        print("Initializing MediaPipe for Evaluator...")
+        self.mp_pose = mp.solutions.pose
+        self.pose_detector = self.mp_pose.Pose(
+            static_image_mode=True, 
+            model_complexity=2, 
+            min_detection_confidence=0.5
+        )
 
     def extract_face_embedding(self, img_pil: Image.Image) -> np.ndarray:
         """Extract normalized ArcFace embedding for the largest face in an image."""
@@ -99,26 +82,52 @@ class Evaluator:
         
     def pose_keypoint_error(self, output_img_pil: Image.Image, pose_reference_pil: Image.Image) -> float:
         """
-        Mean L2 distance between normalized pose keypoints of output and reference.
-        Returns 0.0 if MediaPipe is unavailable (so calling code stays generic).
+        Calculates pose error. If reference is a real image, uses MediaPipe 33-keypoint L2 distance.
+        If reference is an OpenPose skeleton image, extracts skeleton from output and uses pixel-wise MSE.
         """
-        if self.pose_detector is None:
-            return 0.0
-
         out_arr = np.array(output_img_pil.convert("RGB"))
         ref_arr = np.array(pose_reference_pil.convert("RGB"))
-
+        
+        # Check if reference is a skeleton image (mostly black)
+        is_skeleton = np.mean(ref_arr < 15) > 0.60
+        
+        if is_skeleton:
+            try:
+                from controlnet_aux import OpenposeDetector
+                if not hasattr(self, 'openpose'):
+                    # Load OpenPose only once when needed
+                    self.openpose = OpenposeDetector.from_pretrained("lllyasviel/ControlNet")
+                
+                # Extract skeleton from generated image
+                out_skel = self.openpose(output_img_pil, hand_and_face=True)
+                if isinstance(out_skel, np.ndarray):
+                    out_skel = Image.fromarray(out_skel)
+                    
+                # Resize to match reference
+                out_skel = out_skel.resize(pose_reference_pil.size)
+                
+                out_skel_arr = np.array(out_skel).astype(np.float32) / 255.0
+                ref_skel_arr = ref_arr.astype(np.float32) / 255.0
+                
+                # Compute MSE over pixels. Since most pixels are black, MSE is naturally small.
+                # Multiply by 10 to scale it to a similar range as the original MediaPipe error (0.0 to 1.0)
+                mse = np.mean((out_skel_arr - ref_skel_arr) ** 2)
+                return float(mse) * 10.0
+                
+            except ImportError:
+                print("Warning: controlnet_aux not found. Cannot evaluate skeleton pose error.")
+                return 1.0
+                
+        # --- Standard MediaPipe Evaluation for Real Photos ---
         out_results = self.pose_detector.process(out_arr)
         ref_results = self.pose_detector.process(ref_arr)
-
+        
         if not out_results.pose_landmarks or not ref_results.pose_landmarks:
-            # Common case: pose_reference is a stylized skeleton (not a real
-            # photo) and MediaPipe cannot detect a person. Return None-like
-            # signal (NaN) so callers can ignore rather than treat as max-error.
-            return float("nan")
-
+            return 1.0 # Max error if pose not found in either image
+            
         out_kps = np.array([[lm.x, lm.y] for lm in out_results.pose_landmarks.landmark])
         ref_kps = np.array([[lm.x, lm.y] for lm in ref_results.pose_landmarks.landmark])
-
+        
+        # Calculate mean L2 distance across all 33 landmarks
         error = np.linalg.norm(out_kps - ref_kps, axis=1).mean()
         return float(error)
