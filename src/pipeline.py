@@ -572,7 +572,10 @@ def _feather_mask(size: tuple[int, int], feather: int = 24) -> Image.Image:
     m = Image.new("L", (w, h), 255)
     if feather <= 0:
         return m
-    # Shrink slightly then blur, so edges fall off inside the crop
+    # Cap feather so the inset rectangle is always valid (crop may be small)
+    feather = min(feather, w // 2 - 1, h // 2 - 1)
+    if feather <= 0:
+        return m
     inset = Image.new("L", (w, h), 0)
     from PIL import ImageDraw
     ImageDraw.Draw(inset).rectangle(
